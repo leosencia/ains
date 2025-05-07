@@ -1,27 +1,45 @@
 from PIL import Image
+import math
 
 
-def determine_tiling_dimensions(image):
+def determine_tiling_dimensions(image, segmentation):
     """
-    Prompt the user for tiling intensity (1-3) and calculate the number of rows and columns
-    based on the input image size. Intensity 1 results in fewer tiles, while intensity 3
-    results in more tiles.
+    Calculate the number of rows and columns dynamically based on:
+    1. Image dimensions
+    2. Segmentation level (1-3)
+    3. Target tile sizes that work well with the model
     """
-    # while True:
-    #     try:
-    #         intensity = int(input("Enter tiling intensity (1-3): "))
-    #         if intensity in [1, 2, 3]:
-    #             break
-    #         else:
-    #             print("Please enter a valid choice: 1, 2, or 3.")
-    #     except ValueError:
-    #         print("Please enter an integer.")
-    intensity = 2
+    # Get image dimensions
+    width, height = image.width, image.height
 
-    # Map intensity to tiling dimensions: using powers of 2 for demonstration
-    rows = max(1, int((image.height * intensity) / 500))
-    cols = max(1, int((image.width * intensity) / 500))
-    print(f"Tiling will be done using {rows} rows and {cols} columns.")
+    # Calculate the total number of pixels in the image
+    total_pixels = width * height
+
+    # Target tile sizes (in pixels) for different segmentation levels
+    if segmentation == 1:  # Low segmentation - larger tiles
+        target_tile_pixels = 128 * 1024  # ~128K pixels per tile
+    elif segmentation == 2:  # Medium segmentation
+        target_tile_pixels = 65 * 1024  # ~65K pixels per tile (~256x256)
+    else:  # High segmentation - smaller tiles
+        target_tile_pixels = 32 * 1024  # ~32K pixels per tile
+
+    # Calculate approximate number of tiles needed
+    target_tiles = max(1, total_pixels / target_tile_pixels)
+
+    # Find a balanced grid size (trying to keep tiles somewhat square)
+    aspect_ratio = width / height
+
+    # Calculate rows and columns to maintain aspect ratio
+    cols = int(round(math.sqrt(target_tiles * aspect_ratio)))
+    rows = int(round(target_tiles / cols))
+
+    # Ensure at least one row and column
+    rows = max(1, rows)
+    cols = max(1, cols)
+
+    print(f"Image {width}x{height}, Segmentation level {segmentation}")
+    print(f"Tiling using {rows} rows and {cols} columns")
+
     return rows, cols
 
 
