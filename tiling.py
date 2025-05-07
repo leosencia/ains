@@ -1,9 +1,5 @@
 import torch
-
-# Keep VAE import for now, needed for latents
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-
-# Import pgd_attack and save_image from pgd_test
 from pgd import pgd_attack, save_image
 import numpy as np
 from PIL import Image
@@ -14,18 +10,27 @@ import os
 import random
 from torchvision import transforms  # Keep transforms
 
-# Import tokenizer and text encoder
 from transformers import (
     AutoTokenizer,
     CLIPTextModel,
-)  # Assuming CLIPTextModel for SD 2.1
+)
+
+global_progress_callback = None
+
+
+def log_message(message):
+    """Global logging function that works outside of classes"""
+    print(message)
+    if global_progress_callback:
+        global_progress_callback(message)
+
 
 # Define device (ensure consistency)
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 MODEL_ID = "stabilityai/stable-diffusion-2-1"  # Define model ID
 
 # --- Load Diffusion Model Components ---
-print(f"Loading components from {MODEL_ID}...")
+log_message(f"Loading components from {MODEL_ID}...")
 vae = AutoencoderKL.from_pretrained(
     MODEL_ID, subfolder="vae", torch_dtype=torch.float16
 ).to(device)
@@ -44,13 +49,26 @@ unet.eval()  # Use eval mode for attack surrogate
 vae.requires_grad_(False)
 text_encoder.requires_grad_(False)
 unet.requires_grad_(False)  # Don't train the UNet during attack
-print("Diffusion components loaded.")
+log_message("Diffusion components loaded.")
 
 
 class TileInator:
     def __init__(
-        self, overlap_size, image, tile_width, tile_height, num_cols, num_rows
+        self,
+        overlap_size,
+        image,
+        tile_width,
+        tile_height,
+        num_cols,
+        num_rows,
+        intensity,
+        prompt,
+        filename,
+        output_path,
+        progress_callback=None,
     ):
+        global global_progress_callback
+        global_progress_callback = progress_callback
         self.overlap_size = overlap_size
         self.image = image
         self.tile_width = tile_width
@@ -65,29 +83,43 @@ class TileInator:
         self.noise_scheduler = noise_scheduler
         self.device = device
         # Define a generic prompt or use one from config if available
-        self.instance_prompt = "a photo"  # Or "a van gogh style photo" etc.
+        self.instance_prompt = prompt
+        self.intensity = intensity
+        self.progress_callback = progress_callback
+        self.filename = filename
+        self.output_path = output_path
+
+    def log(self, message):
+        """Log message to console and progress callback if available"""
+        print(message)
+        if self.progress_callback:
+            self.progress_callback(message)
 
     def process_image(self):
         tiles = self._tile_inator()
-        print("Starting perturbation process...")
+        self.log("Starting perturbation process...")
         perturbed_tiles = self.lazy_tile_inator(tiles)
-        print("Finished perturbation. Starting stitching...")
+        self.log("Finished perturbation. Starting stitching...")
         final_image = self.stitch_perturbed_tiles(
             perturbed_tiles, self.num_rows, self.num_cols
         )
         # Use 4 digits for random integer
-        random_4_digit_integer = random.randint(1000, 9999)
+        # random_4_digit_integer = random.randint(1000, 9999)
         # Include identifier for attack type in filename
-        output_file_name = f"AdvDiffNoise_GPP_{random_4_digit_integer}.png"
-        print(f"Saving final stitched image to {output_file_name}...")
-        final_image.save(output_file_name)
-        print("Processing complete.")
+        # output_file_name = f"AdvDiffNoise_GPP_{random_4_digit_integer}.png"
+        self.log(f"Saving final stitched image to {self.filename}...")
+        base_filename = os.path.basename(self.filename)
+        full_output_path = os.path.join(self.output_path, f"protected_{base_filename}")
+        final_image.save(full_output_path)
+        self.log("Processing complete.")
+
+        return full_output_path
 
     # _tile_inator remains the same as your latest version (with RGB conversion)
     def _tile_inator(self):
         # --- Ensure input image is RGB ---
         if self.image.mode != "RGB":
-            print(f"Converting input image from {self.image.mode} to RGB.")
+            self.log(f"Converting input image from {self.image.mode} to RGB.")
             self.image = self.image.convert("RGB")
 
         image_np = np.array(self.image)
@@ -105,27 +137,27 @@ class TileInator:
             self.num_cols - rem_width
         )
 
-        print("Creating Dask array for tiling...")
+        self.log("Creating Dask array for tiling...")
         da_image = da.from_array(image_np, chunks=(chunks_height, chunks_width, 3))
-        print("Computing tiles from Dask array...")
+        self.log("Computing tiles from Dask array...")
         tiles = list(dask.compute(*da_image.to_delayed().flatten()))
-        print(f"Generated {len(tiles)} tiles.")
+        self.log(f"Generated {len(tiles)} tiles.")
 
         # --- Optional: Save initial tiles ---
-        save_dir = os.path.join("resources", "images", "initial_tiles")
-        os.makedirs(save_dir, exist_ok=True)
-        print(f"Saving initial tiles to {save_dir}...")
-        for i, tile_array in enumerate(tiles):
-            try:
-                if tile_array.shape[-1] != 3:
-                    continue
-                tile_array_uint8 = np.clip(tile_array, 0, 255).astype(np.uint8)
-                tile_img = Image.fromarray(tile_array_uint8)
-                tile_filename = os.path.join(save_dir, f"tile_{i:03d}.png")
-                tile_img.save(tile_filename)
-            except Exception as e:
-                print(f"Error saving initial tile {i}: {e}")
-        print("Finished saving initial tiles.")
+        # save_dir = os.path.join("resources", "images", "initial_tiles")
+        # os.makedirs(save_dir, exist_ok=True)
+        # print(f"Saving initial tiles to {save_dir}...")
+        # for i, tile_array in enumerate(tiles):
+        #     try:
+        #         if tile_array.shape[-1] != 3:
+        #             continue
+        #         tile_array_uint8 = np.clip(tile_array, 0, 255).astype(np.uint8)
+        #         tile_img = Image.fromarray(tile_array_uint8)
+        #         tile_filename = os.path.join(save_dir, f"tile_{i:03d}.png")
+        #         tile_img.save(tile_filename)
+        #     except Exception as e:
+        #         print(f"Error saving initial tile {i}: {e}")
+        # print("Finished saving initial tiles.")
         # --- End saving initial tiles ---
 
         return tiles  # List of NumPy arrays (RGB, uint8)
@@ -144,21 +176,37 @@ class TileInator:
         )
         with torch.no_grad():
             text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
-        uncond_input = self.tokenizer(  # For classifier-free guidance if needed, though not used in basic loss
-            "",
-            padding="max_length",
-            max_length=text_input.input_ids.shape[-1],
-            return_tensors="pt",
-        )
+            uncond_input = self.tokenizer(  # For classifier-free guidance if needed, though not used in basic loss
+                "",
+                padding="max_length",
+                max_length=text_input.input_ids.shape[-1],
+                return_tensors="pt",
+            )
         with torch.no_grad():
             uncond_embeddings = self.text_encoder(
                 uncond_input.input_ids.to(self.device)
             )[0]
         # For basic MSE loss, only text_embeddings are needed
-        # text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # If doing CFG
+        # text_embeddings = torch.cat(
+        # [uncond_embeddings, text_embeddings]
+        # )  # If doing CFG
+
+        perturbation_parameters = []
+        if self.intensity == 1:
+            perturbation_parameters.append(0.04)
+            perturbation_parameters.append(0.004)
+            perturbation_parameters.append(30)
+        elif self.intensity == 2:
+            perturbation_parameters.append(0.06)
+            perturbation_parameters.append(0.006)
+            perturbation_parameters.append(40)
+        else:
+            perturbation_parameters.append(0.09)
+            perturbation_parameters.append(0.009)
+            perturbation_parameters.append(50)
 
         for i, tile_np_rgb in enumerate(tiles):
-            print(f"  Perturbing tile {i+1}/{num_tiles}...")
+            self.log(f"  Perturbing tile {i+1}/{num_tiles}...")
             # tile_np_rgb is already numpy RGB uint8 from _tile_inator
 
             # Perform the diffusion noise prediction attack
@@ -169,10 +217,16 @@ class TileInator:
                 self.noise_scheduler,
                 self.vae,
                 self.device,
-                # Epsilon/Alpha in [-1, 1] range for normalized data
-                epsilon=0.05,  # Example: Corresponds roughly to 12/255
-                alpha=0.01,  # Example: Corresponds roughly to 2.5/255
-                num_iterations=30,  # Adjust as needed
+                epsilon=perturbation_parameters[
+                    0
+                ],  # Increased epsilon to match Anti-DreamBooth (5e-2)
+                alpha=perturbation_parameters[
+                    1
+                ],  # Adjusted alpha (proportionally or match Anti-DreamBooth if specified, using 1/10th of epsilon here)
+                num_iterations=perturbation_parameters[
+                    2
+                ],  # Keep iterations or adjust as needed
+                progress_callback=self.progress_callback,
             )
             perturbed_tiles.append(
                 perturbed_tile_tensor
@@ -244,9 +298,9 @@ class TileInator:
                 row_image = np.hstack(padded_row_tiles)
                 rows_of_images.append(row_image)
             except ValueError as e:
-                print(f"Error stacking tiles horizontally in row {r}: {e}")
+                self.log(f"Error stacking tiles horizontally in row {r}: {e}")
                 for i, t in enumerate(padded_row_tiles):
-                    print(f"  Tile {i} shape: {t.shape}")
+                    self.log(f"  Tile {i} shape: {t.shape}")
                 raise e
 
         final_rows = []
@@ -258,7 +312,7 @@ class TileInator:
         for i, row_img in enumerate(rows_of_images):
             h, w, _ = row_img.shape
             if w != max_overall_width:
-                print(
+                self.log(
                     f"Warning: Resizing row {i} horizontally. Expected {max_overall_width}, got {w}."
                 )
                 resized_row = cv2.resize(
@@ -271,9 +325,9 @@ class TileInator:
         try:
             stitched_image_np = np.vstack(final_rows)
         except ValueError as e:
-            print(f"Error stacking rows vertically: {e}")
+            self.log(f"Error stacking rows vertically: {e}")
             for i, row_img in enumerate(final_rows):
-                print(f"  Row {i} shape: {row_img.shape}")
+                self.log(f"  Row {i} shape: {row_img.shape}")
             raise e
 
         stitched_image_pil = Image.fromarray(stitched_image_np)
@@ -311,7 +365,7 @@ class TileInator:
 
             # Base case: first wave with single tile
             if wave_idx == 0 and len(wave) == 1:
-                print("Processing first wave with single tile")
+                self.log("Processing first wave with single tile")
                 # Convert tile to format expected by pgd_attack
                 first_tile = np.array(wave[0])
                 # Convert RGB to BGR for PGD attack (since it uses OpenCV)
