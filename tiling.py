@@ -7,8 +7,6 @@ import cv2
 import dask
 import dask.array as da
 import os
-import random
-from torchvision import transforms  # Keep transforms
 
 from transformers import (
     AutoTokenizer,
@@ -16,6 +14,85 @@ from transformers import (
 )
 
 global_progress_callback = None
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+MODEL_ID = "stabilityai/stable-diffusion-2-1"
+
+# Initialize global model variables
+vae = None
+tokenizer = None
+text_encoder = None
+unet = None
+noise_scheduler = None
+model_loaded = False
+
+
+# Try to use local model first
+def get_model_path():
+    """Get the path to the locally downloaded model files"""
+    return os.path.join(
+        os.path.expanduser("~"), ".ains", "models", "stable-diffusion-2-1"
+    )
+
+
+local_model_path = get_model_path()
+if os.path.exists(local_model_path) and os.listdir(local_model_path):
+    MODEL_ID = local_model_path
+    print(f"Using local model at: {MODEL_ID}")
+else:
+    # Fallback to online model (will be downloaded at first use)
+    MODEL_ID = "stabilityai/stable-diffusion-2-1"
+
+
+# Initialize models directly
+def load_models(progress_callback=None):
+    """Load all models during splash screen"""
+    global vae, tokenizer, text_encoder, unet, noise_scheduler, global_progress_callback
+    global_progress_callback = progress_callback
+
+    if progress_callback:
+        progress_callback("Loading model components...")
+
+    # Load all components to device immediately
+    vae = AutoencoderKL.from_pretrained(
+        MODEL_ID, subfolder="vae", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("VAE model loaded")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
+
+    if progress_callback:
+        progress_callback("Tokenizer loaded")
+
+    text_encoder = CLIPTextModel.from_pretrained(
+        MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("Text encoder loaded")
+
+    unet = UNet2DConditionModel.from_pretrained(
+        MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("UNet model loaded")
+
+    noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+
+    if progress_callback:
+        progress_callback("All models loaded successfully!")
+
+    # Set models to eval mode (important for inference)
+    vae.eval()
+    text_encoder.eval()
+    unet.eval()
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+
+    return True
 
 
 def log_message(message):
@@ -25,33 +102,175 @@ def log_message(message):
         global_progress_callback(message)
 
 
-# Define device (ensure consistency)
-device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-MODEL_ID = "stabilityai/stable-diffusion-2-1"  # Define model ID
+def check_models_exist():
+    """Check if models exist on disk without loading them"""
+    model_path = os.path.join(
+        os.path.expanduser("~"), ".ains", "models", "stable-diffusion-2-1"
+    )
+    if not os.path.exists(model_path):
+        return False
 
-# --- Load Diffusion Model Components ---
-log_message(f"Loading components from {MODEL_ID}...")
-vae = AutoencoderKL.from_pretrained(
-    MODEL_ID, subfolder="vae", torch_dtype=torch.float16
-).to(device)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
-text_encoder = CLIPTextModel.from_pretrained(
-    MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
-).to(device)
-unet = UNet2DConditionModel.from_pretrained(
-    MODEL_ID, subfolder="unet", torch_dtype=torch.float16
-).to(device)
-noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+    # Check for essential files
+    required_files = [
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "unet/diffusion_pytorch_model.bin",
+        "vae/diffusion_pytorch_model.bin",
+        "text_encoder/pytorch_model.bin",
+    ]
 
-vae.eval()
-text_encoder.eval()
-unet.eval()  # Use eval mode for attack surrogate
-vae.requires_grad_(False)
-text_encoder.requires_grad_(False)
-unet.requires_grad_(False)  # Don't train the UNet during attack
-log_message("Diffusion components loaded.")
+    for file_path in required_files:
+        if not os.path.exists(os.path.join(model_path, file_path)):
+            return False
+
+    return True
 
 
+def process_with_limited_memory(input_image_processor):
+    # Move only needed model to GPU as they're needed
+    log_message("Moving VAE to GPU for encoding...")
+    vae.to(device)
+
+    # Encode image
+    encoded_images = input_image_processor._encode_images()
+
+    # Free VAE GPU memory
+    vae.to("cpu")
+    torch.cuda.empty_cache()
+
+    log_message("Moving text encoder to GPU...")
+    text_encoder.to(device)
+
+    # Encode text
+    text_embeddings = input_image_processor._encode_prompt()
+
+    # Free text encoder GPU memory
+    text_encoder.to("cpu")
+    torch.cuda.empty_cache()
+
+    log_message("Moving UNet to GPU for perturbation...")
+    unet.to(device)
+
+    # Run perturbation
+    perturbed_images = input_image_processor._perturb_images(
+        encoded_images, text_embeddings
+    )
+
+    # Free UNet GPU memory
+    unet.to("cpu")
+    torch.cuda.empty_cache()
+
+    # Final steps
+    log_message("Moving VAE to GPU for decoding...")
+    vae.to(device)
+
+    # Decode images
+    output_images = input_image_processor._decode_images(perturbed_images)
+
+    # Free all GPU memory
+    vae.to("cpu")
+    torch.cuda.empty_cache()
+
+    return output_images
+
+
+def prepare_for_processing():
+    """Load models only when needed for processing"""
+    global vae, tokenizer, text_encoder, unet, noise_scheduler, model_loaded
+
+    try:
+        log_message("Loading AI models for the first time...")
+
+        # Use fp16 precision and memory optimization
+        vae = AutoencoderKL.from_pretrained(
+            MODEL_ID, subfolder="vae", torch_dtype=torch.float16
+        )
+        log_message("VAE model loaded")
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
+        log_message("Tokenizer loaded")
+
+        try:
+            # First try to load to device
+            device_to_use = device
+            text_encoder = CLIPTextModel.from_pretrained(
+                MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("Text encoder loaded to GPU")
+        except Exception as e:
+            # Fall back to CPU if GPU fails
+            log_message(
+                f"GPU loading failed: {str(e)}. Falling back to CPU for text encoder."
+            )
+            device_to_use = "cpu"
+            text_encoder = CLIPTextModel.from_pretrained(
+                MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("Text encoder loaded to CPU")
+
+        try:
+            # Try loading UNet to GPU
+            unet = UNet2DConditionModel.from_pretrained(
+                MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("UNet model loaded to GPU")
+        except Exception as e:
+            # Fall back to CPU if GPU loading fails
+            log_message(f"GPU loading failed for UNet: {str(e)}. Using CPU.")
+            unet = UNet2DConditionModel.from_pretrained(
+                MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+            ).to("cpu")
+            log_message("UNet model loaded to CPU")
+
+        # Load scheduler (small model)
+        noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+        log_message("All models loaded successfully!")
+
+        # Set models to eval mode
+        vae.eval()
+        text_encoder.eval()
+        unet.eval()
+
+        model_loaded = True
+        return True
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            log_message(
+                "GPU OUT OF MEMORY: Try closing other applications or use a smaller batch size"
+            )
+        log_message(f"Error loading models: {e}")
+        return False
+    except Exception as e:
+        log_message(f"Error loading models: {e}")
+        return False
+
+
+def release_memory():
+    """Move models back to CPU after processing to free GPU memory"""
+    global vae, text_encoder, unet
+
+    try:
+        log_message("Moving AI models back to CPU...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        vae.to("cpu")
+        text_encoder.to("cpu")
+        unet.to("cpu")
+
+        # Force garbage collection
+        import gc
+
+        gc.collect()
+
+        log_message("Memory released successfully")
+        return True
+    except Exception as e:
+        log_message(f"Error releasing memory: {e}")
+        return False
+
+
+# Modify TileInator class to use the global model instances
 class TileInator:
     def __init__(
         self,
@@ -67,25 +286,30 @@ class TileInator:
         output_path,
         progress_callback=None,
     ):
-        global global_progress_callback
+        global vae, tokenizer, text_encoder, unet, noise_scheduler, global_progress_callback, device
+
+        # Store reference to global callback
         global_progress_callback = progress_callback
+        self.progress_callback = progress_callback
+
+        # Store processing parameters
         self.overlap_size = overlap_size
         self.image = image
         self.tile_width = tile_width
         self.tile_height = tile_height
         self.num_cols = num_cols
         self.num_rows = num_rows
-        # Store diffusion components
+
+        # Use the global model instances
         self.vae = vae
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
         self.unet = unet
         self.noise_scheduler = noise_scheduler
         self.device = device
-        # Define a generic prompt or use one from config if available
+
         self.instance_prompt = prompt
         self.intensity = intensity
-        self.progress_callback = progress_callback
         self.filename = filename
         self.output_path = output_path
 
