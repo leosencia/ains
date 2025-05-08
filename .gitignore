@@ -27,3 +27,6 @@ build/
 
 # Logs
 *.log
+
+# Specific files to ignore (examples)
+AI-No-Swiping.spec
