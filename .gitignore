@@ -1,5 +1,7 @@
 # Ignore images folder
 resources/images/
+dist/
+build/
 
 # Python cache files
 __pycache__/
