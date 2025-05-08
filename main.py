@@ -1,13 +1,8 @@
 from image_preprocessing import determine_tiling_dimensions, compute_tile_size
 from PIL import Image
 
-from tiling import TileInator
+# from tiling import TileInator
 import os  # Import the os module
-import torch
-import torch.nn.functional as F
-from torchvision import transforms
-from torchvision.models import vgg19, VGG19_Weights
-import subprocess
 
 # from PyQt5 import QtWidgets, QtGui, QtCore
 from PyQt5.QtGui import QFontDatabase, QPixmap, QDragEnterEvent, QDropEvent
@@ -18,11 +13,112 @@ from PyQt5.QtWidgets import (
     QLabel,
     QVBoxLayout,
     QWidget,
+    QSplashScreen,
 )
 from PyQt5.QtCore import QObject, QEvent, Qt
 import sys
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
+
+TileInator = None
+
+
+class ModelLoader(QThread):
+    finished = pyqtSignal()
+    status_update = pyqtSignal(str)
+
+    def run(self):
+        global TileInator
+
+        try:
+            # Import tiling module with full model loading
+            from tiling import TileInator as TI, load_models
+
+            # Load all models directly during splash screen
+            self.status_update.emit("Loading model components...")
+            load_models(self.status_update.emit)
+
+            # Make TileInator available globally
+            TileInator = TI
+
+            self.finished.emit()
+        except Exception as e:
+            self.status_update.emit(f"Error loading models: {str(e)}")
+
+
+class SplashScreen(QSplashScreen):
+    def __init__(self):
+        # Create splash screen with logo
+        logo_path = os.path.join("resources", "gui", "logo.png")
+        pixmap = QtGui.QPixmap(600, 300)
+        pixmap.fill(QtGui.QColor("#1E1E20"))
+        super().__init__(pixmap)
+
+        # Setup layout
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        # Add logo
+        self.logo = QtWidgets.QLabel()
+        self.logo.setPixmap(
+            QtGui.QPixmap(logo_path).scaled(100, 100, QtCore.Qt.KeepAspectRatio)
+        )
+        self.logo.setAlignment(QtCore.Qt.AlignHCenter)
+        layout.addWidget(self.logo)
+
+        # Add title
+        self.title = QtWidgets.QLabel("AI-No-Swiping")
+        font = QtGui.QFont()
+        font.setFamily("Georama Black")  # Uses custom Georama Black font
+        font.setPointSize(24)
+        font.setBold(True)
+        self.title.setFont(font)
+        self.title.setStyleSheet("color: #27c9bb; font-size: 24px; font-weight: bold;")
+        self.title.setAlignment(QtCore.Qt.AlignHCenter)
+        layout.addWidget(self.title)
+
+        # Add status
+        self.status = QtWidgets.QLabel(
+            "Wohoi teka lang! The models are still being loaded. Please wait..."
+        )
+        self.status.setStyleSheet("color: white;")
+        self.status.setAlignment(QtCore.Qt.AlignHCenter)
+        layout.addWidget(self.status)
+
+        # Add progress bar
+        self.progress = QtWidgets.QProgressBar()
+        self.progress.setRange(0, 0)  # Indeterminate
+        self.progress.setTextVisible(False)
+        self.progress.setStyleSheet(
+            """
+                QProgressBar{
+                    background-color: #232323;
+                    border-radius: 10px;
+                    text-align: center;
+                    padding: 1px;
+                    height: 12px;
+                }
+                QProgressBar::chunk {
+                    background-color: #27c9bb;
+                    border-radius: 9px;
+                    margin: 1px;
+                }
+            """
+        )
+        layout.addWidget(self.progress)
+
+        self.setLayout(layout)
+
+        # Keep on top and make modal
+        self.setWindowFlags(
+            QtCore.Qt.WindowStaysOnTopHint
+            | QtCore.Qt.FramelessWindowHint
+            | QtCore.Qt.Tool
+        )
+
+    def update_status(self, message):
+        self.status.setText(message)
+        QApplication.processEvents()
 
 
 # Class for processing the perturbation. Needs to be separate from GUI to prevent GUI from not responding.
@@ -56,17 +152,8 @@ class ProcessingThread(QThread):
                     tile_width, tile_height = compute_tile_size(image, rows, cols)
                     overlap_size = int(tile_height * 0.1)
 
-                    self.progress.emit(
-                        f"Tiling with {rows}x{cols} grid, {overlap_size}px overlap"
-                    )
-
-                    # Prepare output filename
-                    base_filename = os.path.basename(image_path)
-                    output_file = os.path.join(
-                        self.output_path, f"protected_{base_filename}"
-                    )
-
-                    # Create TileInator instance with the selected parameters
+                    # Process with TileInator
+                    global TileInator
                     input_image_processor = TileInator(
                         overlap_size=overlap_size,
                         image=image,
@@ -81,11 +168,9 @@ class ProcessingThread(QThread):
                         progress_callback=self.progress.emit,
                     )
 
-                    # Process the image and get output path
+                    # Process image
                     output_path = input_image_processor.process_image()
-                    # Emit the processed image path
                     self.image_processed.emit(output_path)
-
                     self.progress.emit(f"✓ Finished processing {filename}")
 
                 except Exception as e:
@@ -113,6 +198,10 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
         )  # all strings to be shown in the progress screen will be stored here
 
     def setupUi(self, MainWindow):
+        icon_path = self.resource_path("resources/gui/logo.png")
+        app_icon = QtGui.QIcon(icon_path)
+        MainWindow.setWindowIcon(app_icon)
+
         MainWindow.setWindowFlags(
             QtCore.Qt.Window
             | QtCore.Qt.CustomizeWindowHint
@@ -1087,6 +1176,10 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
             QPushButton:pressed {
                 background-color: #d7dbd8;
             }
+            QPushButton:disabled {
+                background-color: #424242;
+                color: #777777;
+            }
         """
         )
         self.run_back_btn.setCursor(QtGui.QCursor(QtCore.Qt.PointingHandCursor))
@@ -1735,6 +1828,7 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
 
         # Disable run button while processing to avoid blowing up your computer
         self.run_button.setEnabled(False)
+        self.run_back_btn.setEnabled(False)
 
         # Create and start the processing thread
         self.processing_thread = ProcessingThread(
@@ -1767,7 +1861,7 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
         #         rows, cols = determine_tiling_dimensions(image, self.segmentation)
         #         tile_width, tile_height = compute_tile_size(image, rows, cols)
 
-        #         # Ensure overlap size is an integer
+        #         # Ensure overlap_size is an integer
         #         overlap_size = int(tile_height * 0.1)
 
         #         print(
@@ -1814,6 +1908,7 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
     def on_processing_finished(self, success, message):
         # Re-enable the run button
         self.run_button.setEnabled(True)
+        self.run_back_btn.setEnabled(True)
 
         # Show completion message
         if success:
@@ -1835,7 +1930,9 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
 
     def open_output_directory(self, event):
         """Open output directory in the file manager"""
+
         if hasattr(self, "output_path") and self.output_path:
+
             # check if it exists
             if os.path.isdir(self.output_path):
                 os.startfile(self.output_path)  # only works on Windows at this moment
@@ -1888,73 +1985,33 @@ class Ui_MainWindow(QObject):  # Make it inherit from QObject for event handling
 
 
 if __name__ == "__main__":
-    import sys
-
+    # Initialize application
     app = QtWidgets.QApplication(sys.argv)
-    MainWindow = QtWidgets.QMainWindow()
-    ui = Ui_MainWindow()
 
-    # Load fonts first before setting up UI
-    ui.load_fonts()
+    # Create and show splash screen
+    splash = SplashScreen()
+    splash.show()
+    app.processEvents()
 
-    ui.setupUi(MainWindow)
-    MainWindow.show()
+    # Create loader thread
+    loader = ModelLoader()
+
+    def on_models_loaded():
+        # Create main window when models are loaded
+        MainWindow = QtWidgets.QMainWindow()
+        ui = Ui_MainWindow()
+        ui.load_fonts()
+        ui.setupUi(MainWindow)
+
+        # Show main window and close splash
+        MainWindow.show()
+        splash.finish(MainWindow)
+
+    # Connect signals
+    loader.status_update.connect(splash.update_status)
+    loader.finished.connect(on_models_loaded)
+
+    # Start loading models
+    loader.start()
+
     sys.exit(app.exec_())
-
-
-# def start():
-#     # Define the directory containing the images
-#     image_dir = "resources/images/clean_images/vanGogh/for-training/portraits"
-
-#     # Check if the directory exists
-#     if not os.path.isdir(image_dir):
-#         print(f"Error: Directory not found - {image_dir}")
-#         return
-
-#     print(f"Processing images in directory: {image_dir}")
-
-#     # Loop through all files in the directory
-#     for filename in os.listdir(image_dir):
-#         # Check if the file is a .png or .jpg image (case-insensitive)
-#         if filename.lower().endswith((".png", ".jpg")):
-#             image_path = os.path.join(image_dir, filename)
-#             print(f"\n--- Processing image: {filename} ---")
-
-#             try:
-#                 image = Image.open(image_path)
-#             except Exception as e:
-#                 print(f"Error opening image {filename}: {e}")
-#                 continue  # Skip to the next file if opening fails
-
-#             # --- Perform the same operations as before ---
-#             rows, cols = determine_tiling_dimensions(image)
-#             tile_width, tile_height = compute_tile_size(image, rows, cols)
-
-#             # Ensure overlap_size is an integer
-#             overlap_size = int(tile_height * 0.1)
-
-#             print(
-#                 f"  Tiling with {rows} rows, {cols} columns. Overlap: {overlap_size}px"
-#             )
-
-#             input_image_processor = TileInator(
-#                 overlap_size=overlap_size,
-#                 image=image,
-#                 tile_width=tile_width,
-#                 tile_height=tile_height,
-#                 num_cols=cols,
-#                 num_rows=rows,
-#             )
-#             try:
-#                 input_image_processor.process_image()
-#                 print(f"  Finished processing {filename}.")
-#             except Exception as e:
-#                 print(f"Error processing image {filename}: {e}")
-#                 # Optionally add more detailed error logging here
-#             # --- End of operations ---
-#         else:
-#             # Optional: Print message for non-image files found
-#             # print(f"Skipping non-image file: {filename}")
-#             pass
-
-#     print("\n--- Finished processing all images in the directory ---")
