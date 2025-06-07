@@ -1,5 +1,4 @@
 import torch
-import cv2
 import torch.nn.functional as F
 from torchvision import transforms
 from PIL import Image
@@ -17,12 +16,20 @@ def pgd_attack(
     noise_scheduler,
     vae,
     device,
-    epsilon=0.03,  # Epsilon in [-1, 1] range (e.g., 0.05 approx 12/255)
-    alpha=0.01,  # Alpha in [-1, 1] range (e.g., 0.01 approx 2.5/255)
-    num_iterations=15,
+    epsilon,  # Epsilon in [-1, 1] range (e.g., 0.05 approx 12/255)
+    alpha,  # Alpha in [-1, 1] range (e.g., 0.01 approx 2.5/255)
+    num_iterations,
+    progress_callback=None,
 ):
     global tile_num
-    print(f"  Starting Diffusion PGD attack #{tile_num}...")
+
+    # Logging progress function
+    def log_progress(message):
+        print(message)
+        if progress_callback:
+            progress_callback(message)
+
+    log_progress(f"  Starting Diffusion PGD attack #{tile_num}...")
     tile_num += 1
 
     # --- Preprocessing ---
@@ -58,6 +65,8 @@ def pgd_attack(
 
     # Initialize perturbed image tensor
     perturbed_image = img_tensor.clone().detach().requires_grad_(True)
+
+    log_progress(f"Number of iterations: {num_iterations}")
 
     # PGD Iterations
     for i in range(num_iterations):
@@ -103,7 +112,9 @@ def pgd_attack(
             grad = perturbed_image.grad
             # Ensure gradient is valid before using sign
             if grad is None:
-                print(f"Warning: Gradient is None at iteration {i}. Skipping update.")
+                log_progress(
+                    f"Warning: Gradient is None at iteration {i}. Skipping update."
+                )
                 continue  # Skip update if grad is None
 
             # Update image using gradient sign (gradient ascent)
@@ -128,7 +139,9 @@ def pgd_attack(
 
         # Print progress every 10 iterations
         if (i + 1) % 10 == 0:
-            print(f"    PGD Iteration {i+1}/{num_iterations}, Loss: {loss.item():.4f}")
+            log_progress(
+                f"    Perturbation Iteration {i+1}/{num_iterations}, Loss: {loss.item():.4f}"
+            )
 
     # Detach final result
     final_adv_image = perturbed_image.detach()
@@ -144,7 +157,7 @@ def pgd_attack(
     #      )
 
     # save perturbed tile
-    save_image(final_adv_image, f"adversarial_vae_{tile_num}.png")
+    # save_image(final_adv_image, f"adversarial_vae_{tile_num}.png")
 
     torch.cuda.empty_cache()
     # Return tensor in [-1, 1] range

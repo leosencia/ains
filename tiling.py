@@ -1,9 +1,5 @@
 import torch
-
-# Keep VAE import for now, needed for latents
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
-
-# Import pgd_attack and save_image from pgd_test
 from pgd import pgd_attack, save_image
 import numpy as np
 from PIL import Image
@@ -11,83 +7,343 @@ import cv2
 import dask
 import dask.array as da
 import os
-import random
-from torchvision import transforms  # Keep transforms
 
-# Import tokenizer and text encoder
 from transformers import (
     AutoTokenizer,
     CLIPTextModel,
-)  # Assuming CLIPTextModel for SD 2.1
+)
 
-# Define device (ensure consistency)
+global_progress_callback = None
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-MODEL_ID = "stabilityai/stable-diffusion-2-1"  # Define model ID
+MODEL_ID = "stabilityai/stable-diffusion-2-1"
 
-# --- Load Diffusion Model Components ---
-print(f"Loading components from {MODEL_ID}...")
-vae = AutoencoderKL.from_pretrained(
-    MODEL_ID, subfolder="vae", torch_dtype=torch.float16
-).to(device)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
-text_encoder = CLIPTextModel.from_pretrained(
-    MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
-).to(device)
-unet = UNet2DConditionModel.from_pretrained(
-    MODEL_ID, subfolder="unet", torch_dtype=torch.float16
-).to(device)
-noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
-
-vae.eval()
-text_encoder.eval()
-unet.eval()  # Use eval mode for attack surrogate
-vae.requires_grad_(False)
-text_encoder.requires_grad_(False)
-unet.requires_grad_(False)  # Don't train the UNet during attack
-print("Diffusion components loaded.")
+# Initialize global model variables
+vae = None
+tokenizer = None
+text_encoder = None
+unet = None
+noise_scheduler = None
+model_loaded = False
 
 
+# Try to use local model first
+def get_model_path():
+    """Get the path to the locally downloaded model files"""
+    return os.path.join(
+        os.path.expanduser("~"), ".ains", "models", "stable-diffusion-2-1"
+    )
+
+
+local_model_path = get_model_path()
+if os.path.exists(local_model_path) and os.listdir(local_model_path):
+    MODEL_ID = local_model_path
+    print(f"Using local model at: {MODEL_ID}")
+else:
+    # Fallback to online model (will be downloaded at first use)
+    MODEL_ID = "stabilityai/stable-diffusion-2-1"
+
+
+# Initialize models directly
+def load_models(progress_callback=None):
+    """Load all models during splash screen"""
+    global vae, tokenizer, text_encoder, unet, noise_scheduler, global_progress_callback
+    global_progress_callback = progress_callback
+
+    if progress_callback:
+        progress_callback("Loading model components...")
+
+    # Load all components to device immediately
+    vae = AutoencoderKL.from_pretrained(
+        MODEL_ID, subfolder="vae", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("VAE model loaded")
+
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
+
+    if progress_callback:
+        progress_callback("Tokenizer loaded")
+
+    text_encoder = CLIPTextModel.from_pretrained(
+        MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("Text encoder loaded")
+
+    unet = UNet2DConditionModel.from_pretrained(
+        MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+    ).to(device)
+
+    if progress_callback:
+        progress_callback("UNet model loaded")
+
+    noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+
+    if progress_callback:
+        progress_callback("All models loaded successfully!")
+
+    # Set models to eval mode (important for inference)
+    vae.eval()
+    text_encoder.eval()
+    unet.eval()
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.requires_grad_(False)
+
+    return True
+
+
+def log_message(message):
+    """Global logging function that works outside of classes"""
+    print(message)
+    if global_progress_callback:
+        global_progress_callback(message)
+
+
+def check_models_exist():
+    """Check if models exist on disk without loading them"""
+    model_path = os.path.join(
+        os.path.expanduser("~"), ".ains", "models", "stable-diffusion-2-1"
+    )
+    if not os.path.exists(model_path):
+        return False
+
+    # Check for essential files
+    required_files = [
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "unet/diffusion_pytorch_model.bin",
+        "vae/diffusion_pytorch_model.bin",
+        "text_encoder/pytorch_model.bin",
+    ]
+
+    for file_path in required_files:
+        if not os.path.exists(os.path.join(model_path, file_path)):
+            return False
+
+    return True
+
+
+def process_with_limited_memory(input_image_processor):
+    # Move only needed model to GPU as they're needed
+    log_message("Moving VAE to GPU for encoding...")
+    vae.to(device)
+
+    # Encode image
+    encoded_images = input_image_processor._encode_images()
+
+    # Free VAE GPU memory
+    vae.to("cpu")
+    torch.cuda.empty_cache()
+
+    log_message("Moving text encoder to GPU...")
+    text_encoder.to(device)
+
+    # Encode text
+    text_embeddings = input_image_processor._encode_prompt()
+
+    # Free text encoder GPU memory
+    text_encoder.to("cpu")
+    torch.cuda.empty_cache()
+
+    log_message("Moving UNet to GPU for perturbation...")
+    unet.to(device)
+
+    # Run perturbation
+    perturbed_images = input_image_processor._perturb_images(
+        encoded_images, text_embeddings
+    )
+
+    # Free UNet GPU memory
+    unet.to("cpu")
+    torch.cuda.empty_cache()
+
+    # Final steps
+    log_message("Moving VAE to GPU for decoding...")
+    vae.to(device)
+
+    # Decode images
+    output_images = input_image_processor._decode_images(perturbed_images)
+
+    # Free all GPU memory
+    vae.to("cpu")
+    torch.cuda.empty_cache()
+
+    return output_images
+
+
+def prepare_for_processing():
+    """Load models only when needed for processing"""
+    global vae, tokenizer, text_encoder, unet, noise_scheduler, model_loaded
+
+    try:
+        log_message("Loading AI models for the first time...")
+
+        # Use fp16 precision and memory optimization
+        vae = AutoencoderKL.from_pretrained(
+            MODEL_ID, subfolder="vae", torch_dtype=torch.float16
+        )
+        log_message("VAE model loaded")
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, subfolder="tokenizer")
+        log_message("Tokenizer loaded")
+
+        try:
+            # First try to load to device
+            device_to_use = device
+            text_encoder = CLIPTextModel.from_pretrained(
+                MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("Text encoder loaded to GPU")
+        except Exception as e:
+            # Fall back to CPU if GPU fails
+            log_message(
+                f"GPU loading failed: {str(e)}. Falling back to CPU for text encoder."
+            )
+            device_to_use = "cpu"
+            text_encoder = CLIPTextModel.from_pretrained(
+                MODEL_ID, subfolder="text_encoder", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("Text encoder loaded to CPU")
+
+        try:
+            # Try loading UNet to GPU
+            unet = UNet2DConditionModel.from_pretrained(
+                MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+            ).to(device_to_use)
+            log_message("UNet model loaded to GPU")
+        except Exception as e:
+            # Fall back to CPU if GPU loading fails
+            log_message(f"GPU loading failed for UNet: {str(e)}. Using CPU.")
+            unet = UNet2DConditionModel.from_pretrained(
+                MODEL_ID, subfolder="unet", torch_dtype=torch.float16
+            ).to("cpu")
+            log_message("UNet model loaded to CPU")
+
+        # Load scheduler (small model)
+        noise_scheduler = DDPMScheduler.from_pretrained(MODEL_ID, subfolder="scheduler")
+        log_message("All models loaded successfully!")
+
+        # Set models to eval mode
+        vae.eval()
+        text_encoder.eval()
+        unet.eval()
+
+        model_loaded = True
+        return True
+    except RuntimeError as e:
+        if "CUDA out of memory" in str(e):
+            log_message(
+                "GPU OUT OF MEMORY: Try closing other applications or use a smaller batch size"
+            )
+        log_message(f"Error loading models: {e}")
+        return False
+    except Exception as e:
+        log_message(f"Error loading models: {e}")
+        return False
+
+
+def release_memory():
+    """Move models back to CPU after processing to free GPU memory"""
+    global vae, text_encoder, unet
+
+    try:
+        log_message("Moving AI models back to CPU...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        vae.to("cpu")
+        text_encoder.to("cpu")
+        unet.to("cpu")
+
+        # Force garbage collection
+        import gc
+
+        gc.collect()
+
+        log_message("Memory released successfully")
+        return True
+    except Exception as e:
+        log_message(f"Error releasing memory: {e}")
+        return False
+
+
+# Modify TileInator class to use the global model instances
 class TileInator:
     def __init__(
-        self, overlap_size, image, tile_width, tile_height, num_cols, num_rows
+        self,
+        overlap_size,
+        image,
+        tile_width,
+        tile_height,
+        num_cols,
+        num_rows,
+        intensity,
+        prompt,
+        filename,
+        output_path,
+        progress_callback=None,
     ):
+        global vae, tokenizer, text_encoder, unet, noise_scheduler, global_progress_callback, device
+
+        # Store reference to global callback
+        global_progress_callback = progress_callback
+        self.progress_callback = progress_callback
+
+        # Store processing parameters
         self.overlap_size = overlap_size
         self.image = image
         self.tile_width = tile_width
         self.tile_height = tile_height
         self.num_cols = num_cols
         self.num_rows = num_rows
-        # Store diffusion components
+
+        # Use the global model instances
         self.vae = vae
         self.tokenizer = tokenizer
         self.text_encoder = text_encoder
         self.unet = unet
         self.noise_scheduler = noise_scheduler
         self.device = device
-        # Define a generic prompt or use one from config if available
-        self.instance_prompt = "a photo"  # Or "a van gogh style photo" etc.
+
+        self.instance_prompt = prompt
+        self.intensity = intensity
+        self.filename = filename
+        self.output_path = output_path
+
+    def log(self, message):
+        """Log message to console and progress callback if available"""
+        print(message)
+        if self.progress_callback:
+            self.progress_callback(message)
 
     def process_image(self):
         tiles = self._tile_inator()
-        print("Starting perturbation process...")
+        self.log("Starting perturbation process...")
         perturbed_tiles = self.lazy_tile_inator(tiles)
-        print("Finished perturbation. Starting stitching...")
+        self.log("Finished perturbation. Starting stitching...")
         final_image = self.stitch_perturbed_tiles(
             perturbed_tiles, self.num_rows, self.num_cols
         )
         # Use 4 digits for random integer
-        random_4_digit_integer = random.randint(1000, 9999)
+        # random_4_digit_integer = random.randint(1000, 9999)
         # Include identifier for attack type in filename
-        output_file_name = f"AdvDiffNoise_GPP_{random_4_digit_integer}.png"
-        print(f"Saving final stitched image to {output_file_name}...")
-        final_image.save(output_file_name)
-        print("Processing complete.")
+        # output_file_name = f"AdvDiffNoise_GPP_{random_4_digit_integer}.png"
+        self.log(f"Saving final stitched image to {self.filename}...")
+        base_filename = os.path.basename(self.filename)
+        full_output_path = os.path.join(self.output_path, f"protected_{base_filename}")
+        final_image.save(full_output_path)
+        self.log("Processing complete.")
+
+        return full_output_path
 
     # _tile_inator remains the same as your latest version (with RGB conversion)
     def _tile_inator(self):
         # --- Ensure input image is RGB ---
         if self.image.mode != "RGB":
-            print(f"Converting input image from {self.image.mode} to RGB.")
+            self.log(f"Converting input image from {self.image.mode} to RGB.")
             self.image = self.image.convert("RGB")
 
         image_np = np.array(self.image)
@@ -105,27 +361,27 @@ class TileInator:
             self.num_cols - rem_width
         )
 
-        print("Creating Dask array for tiling...")
+        self.log("Creating Dask array for tiling...")
         da_image = da.from_array(image_np, chunks=(chunks_height, chunks_width, 3))
-        print("Computing tiles from Dask array...")
+        self.log("Computing tiles from Dask array...")
         tiles = list(dask.compute(*da_image.to_delayed().flatten()))
-        print(f"Generated {len(tiles)} tiles.")
+        self.log(f"Generated {len(tiles)} tiles.")
 
         # --- Optional: Save initial tiles ---
-        save_dir = os.path.join("resources", "images", "initial_tiles")
-        os.makedirs(save_dir, exist_ok=True)
-        print(f"Saving initial tiles to {save_dir}...")
-        for i, tile_array in enumerate(tiles):
-            try:
-                if tile_array.shape[-1] != 3:
-                    continue
-                tile_array_uint8 = np.clip(tile_array, 0, 255).astype(np.uint8)
-                tile_img = Image.fromarray(tile_array_uint8)
-                tile_filename = os.path.join(save_dir, f"tile_{i:03d}.png")
-                tile_img.save(tile_filename)
-            except Exception as e:
-                print(f"Error saving initial tile {i}: {e}")
-        print("Finished saving initial tiles.")
+        # save_dir = os.path.join("resources", "images", "initial_tiles")
+        # os.makedirs(save_dir, exist_ok=True)
+        # print(f"Saving initial tiles to {save_dir}...")
+        # for i, tile_array in enumerate(tiles):
+        #     try:
+        #         if tile_array.shape[-1] != 3:
+        #             continue
+        #         tile_array_uint8 = np.clip(tile_array, 0, 255).astype(np.uint8)
+        #         tile_img = Image.fromarray(tile_array_uint8)
+        #         tile_filename = os.path.join(save_dir, f"tile_{i:03d}.png")
+        #         tile_img.save(tile_filename)
+        #     except Exception as e:
+        #         print(f"Error saving initial tile {i}: {e}")
+        # print("Finished saving initial tiles.")
         # --- End saving initial tiles ---
 
         return tiles  # List of NumPy arrays (RGB, uint8)
@@ -144,21 +400,37 @@ class TileInator:
         )
         with torch.no_grad():
             text_embeddings = self.text_encoder(text_input.input_ids.to(self.device))[0]
-        uncond_input = self.tokenizer(  # For classifier-free guidance if needed, though not used in basic loss
-            "",
-            padding="max_length",
-            max_length=text_input.input_ids.shape[-1],
-            return_tensors="pt",
-        )
+            uncond_input = self.tokenizer(  # For classifier-free guidance if needed, though not used in basic loss
+                "",
+                padding="max_length",
+                max_length=text_input.input_ids.shape[-1],
+                return_tensors="pt",
+            )
         with torch.no_grad():
             uncond_embeddings = self.text_encoder(
                 uncond_input.input_ids.to(self.device)
             )[0]
         # For basic MSE loss, only text_embeddings are needed
-        # text_embeddings = torch.cat([uncond_embeddings, text_embeddings]) # If doing CFG
+        # text_embeddings = torch.cat(
+        # [uncond_embeddings, text_embeddings]
+        # )  # If doing CFG
+
+        perturbation_parameters = []
+        if self.intensity == 1:
+            perturbation_parameters.append(0.04)
+            perturbation_parameters.append(0.004)
+            perturbation_parameters.append(30)
+        elif self.intensity == 2:
+            perturbation_parameters.append(0.06)
+            perturbation_parameters.append(0.006)
+            perturbation_parameters.append(40)
+        else:
+            perturbation_parameters.append(0.09)
+            perturbation_parameters.append(0.009)
+            perturbation_parameters.append(50)
 
         for i, tile_np_rgb in enumerate(tiles):
-            print(f"  Perturbing tile {i+1}/{num_tiles}...")
+            self.log(f"  Perturbing tile {i+1}/{num_tiles}...")
             # tile_np_rgb is already numpy RGB uint8 from _tile_inator
 
             # Perform the diffusion noise prediction attack
@@ -169,10 +441,16 @@ class TileInator:
                 self.noise_scheduler,
                 self.vae,
                 self.device,
-                # Epsilon/Alpha in [-1, 1] range for normalized data
-                epsilon=0.05,  # Example: Corresponds roughly to 12/255
-                alpha=0.01,  # Example: Corresponds roughly to 2.5/255
-                num_iterations=30,  # Adjust as needed
+                epsilon=perturbation_parameters[
+                    0
+                ],  # Increased epsilon to match Anti-DreamBooth (5e-2)
+                alpha=perturbation_parameters[
+                    1
+                ],  # Adjusted alpha (proportionally or match Anti-DreamBooth if specified, using 1/10th of epsilon here)
+                num_iterations=perturbation_parameters[
+                    2
+                ],  # Keep iterations or adjust as needed
+                progress_callback=self.progress_callback,
             )
             perturbed_tiles.append(
                 perturbed_tile_tensor
@@ -244,9 +522,9 @@ class TileInator:
                 row_image = np.hstack(padded_row_tiles)
                 rows_of_images.append(row_image)
             except ValueError as e:
-                print(f"Error stacking tiles horizontally in row {r}: {e}")
+                self.log(f"Error stacking tiles horizontally in row {r}: {e}")
                 for i, t in enumerate(padded_row_tiles):
-                    print(f"  Tile {i} shape: {t.shape}")
+                    self.log(f"  Tile {i} shape: {t.shape}")
                 raise e
 
         final_rows = []
@@ -258,7 +536,7 @@ class TileInator:
         for i, row_img in enumerate(rows_of_images):
             h, w, _ = row_img.shape
             if w != max_overall_width:
-                print(
+                self.log(
                     f"Warning: Resizing row {i} horizontally. Expected {max_overall_width}, got {w}."
                 )
                 resized_row = cv2.resize(
@@ -271,9 +549,9 @@ class TileInator:
         try:
             stitched_image_np = np.vstack(final_rows)
         except ValueError as e:
-            print(f"Error stacking rows vertically: {e}")
+            self.log(f"Error stacking rows vertically: {e}")
             for i, row_img in enumerate(final_rows):
-                print(f"  Row {i} shape: {row_img.shape}")
+                self.log(f"  Row {i} shape: {row_img.shape}")
             raise e
 
         stitched_image_pil = Image.fromarray(stitched_image_np)
@@ -311,7 +589,7 @@ class TileInator:
 
             # Base case: first wave with single tile
             if wave_idx == 0 and len(wave) == 1:
-                print("Processing first wave with single tile")
+                self.log("Processing first wave with single tile")
                 # Convert tile to format expected by pgd_attack
                 first_tile = np.array(wave[0])
                 # Convert RGB to BGR for PGD attack (since it uses OpenCV)
