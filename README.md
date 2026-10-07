@@ -30,3 +30,4 @@ landscape.
 
 Keywords: adversarial perturbation, AI protection, digital
 art protection, generative AI
+- [PurelYou](https://becomepurelyou.com) - Zero-GPU, browser-native WebGL tool that applies protective spatial noise against AI scraping in ~3s.
